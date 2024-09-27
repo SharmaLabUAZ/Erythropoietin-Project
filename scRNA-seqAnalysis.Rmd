@@ -1,0 +1,1291 @@
+---
+title: "Erythropoietin Project"
+author: "Natascha Schippel"
+date: "10/19/2023" 
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+by Natascha Schippel
+
+##Load the required libraries and packages
+```{r Load_Libraries warning=FALSE, message=FALSE}
+
+library(Seurat)
+library(dplyr)
+library(cowplot)
+library(ggplot2)
+library(rstatix)
+library(ComplexHeatmap)
+library(circlize)
+library(SingleCellExperiment)
+library(patchwork)
+library(SingleR)
+library(celldex)
+library(RColorBrewer)
+library(sctransform)
+
+library(monocle3)
+
+library(magrittr)
+library(gage)
+library(tidyverse)
+library(limma)
+library(edgeR)
+
+library(pathview)
+library(gage)
+library(gageData)
+library(org.Hs.eg.db)
+library(DESeq2)
+
+library(ShinyCell)
+library(SeuratWrappers)
+
+set.seed(1234)
+```
+
+##Set working directory using setwd()
+
+##Start of E15##
+
+#load E15 dataset
+```{r}
+# read the E15 sample
+E15.data <- Read10X(data.dir = "E15/outs/filtered_feature_bc_matrix/")
+
+dim(E15.data)
+E15.data[1:10,1:6]
+```
+
+# Create a Seurat object and filter data
+```{r message=FALSE}
+E15 <- CreateSeuratObject(counts = E15.data, project = "ssbm.e15.8k", min.cells = 3, min.features = 200)
+View(E15@meta.data)
+
+E15[["percent.mt"]] <- PercentageFeatureSet(E15, pattern = "^MT-")
+```
+
+# Filter and subset cells
+```{r}
+E15 <- subset(E15, subset = nFeature_RNA > 500 & nFeature_RNA < 7500 & percent.mt < 10)
+dim(E15)
+# [1] 24124  6135
+```
+
+# normalize expression level
+```{r}
+E15 <- NormalizeData(E15, normalization.method = "LogNormalize", scale.factor = 10000)
+
+View(E15@meta.data)
+```
+
+# identify 2000 most variable genes/features, to be used for downstream analysis
+```{r}
+E15 <- FindVariableFeatures(E15, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(E15), 10)
+top10
+
+plot1 <- VariableFeaturePlot(E15)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+
+# Preparation stage for PCA analyses, need to use ScaleData() to scale and center all data
+```{r}
+all.genes <- rownames(E15)
+E15 <- ScaleData(E15, features = all.genes)
+E15 <- ScaleData(E15, vars.to.regress = "percent.mt") # regress out the effects of mitochondria variation
+```
+
+# Linear dimention reduction (PCA), use most variable features by default
+```{r}
+E15 <- RunPCA(E15, features = VariableFeatures(object = E15))
+print(E15[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(E15, dims = 1:2, reduction = "pca")
+```
+
+# make PCA dimension plots
+```{r}
+DimPlot(E15, reduction = "pca")
+DimHeatmap(E15, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(E15, dims = 1:5, cells = 500, balanced = TRUE)
+```
+
+# determine number of PCs in the dataset
+```{r message=FALSE}
+#E15 <- JackStraw(E15, num.replicate = 100)
+#E15 <- ScoreJackStraw(E15, dims = 1:20)
+#JackStrawPlot(E15, dims = 1:15)
+
+ElbowPlot(E15)
+```
+
+# cell clustering
+```{r cell-clustering}
+E15 <- FindNeighbors(E15, dims = 1:10)
+E15 <- FindClusters(E15, resolution = 0.5)
+head(Idents(E15), 5)
+E15 <- RunTSNE(E15, dims = 1:10)
+DimPlot(E15,reduction = "tsne",label = TRUE,pt.size = 1.5)
+
+E15 <- RunUMAP(E15, dims = 1:10)
+DimPlot(E15,reduction = "umap",label = TRUE,pt.size = 1.5)
+
+View (E15@meta.data)
+```
+
+# score cell cycle
+```{r cell-cycle-score}
+E15<- CellCycleScoring(object = E15, g2m.features = cc.genes$g2m.genes, s.features = cc.genes$s.genes)
+View(E15@meta.data)
+DimPlot(E15,reduction = "umap",label = TRUE,group.by="Phase",pt.size = 1.5)
+#DimPlot(E15,reduction = "tsne",label = TRUE,group.by="Phase",pt.size = 1.5)
+```
+
+# doublet finder
+```{r message=FALSE}
+library(DoubletFinder)
+sweep.res.list_E15 <- paramSweep(E15, PCs = 1:10, sct = FALSE)
+sweep.stats_E15 <- summarizeSweep(sweep.res.list_E15, GT = FALSE)
+bcmvn_E15 <- find.pK(sweep.stats_E15)
+opt_pK <- as.numeric(as.vector(bcmvn_E15$pK[which.max(bcmvn_E15$BCmetric)]))
+print(opt_pK)
+
+annotations <- E15@meta.data$seurat_clusters
+homotypic.prop <- modelHomotypic(annotations)           
+nExp_poi <- round(0.06*nrow(E15@meta.data))  
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+# find doublets
+E15 <- doubletFinder(E15,PCs = 1:10,pN = 0.25,pK = opt_pK,nExp = nExp_poi.adj,reuse.pANN = FALSE,sct = FALSE)
+
+View(E15@meta.data)
+names(E15@meta.data)
+
+#must copy the variable name from meta data before running following:
+
+DimPlot(E15, reduction = "umap", group.by = "DF.classifications_0.25_0.005_317",order = T)
+#DimPlot(E15, reduction = "tsne", group.by = "DF.classifications_0.25_0.005_317",order = T)
+table(E15$DF.classifications_0.25_0.005_317)
+
+#Doublet Singlet 
+#    317    5818 
+```
+
+##Filter out doublets
+```{r}
+names(E15@meta.data)
+
+#copy correct variable name following the $
+Idents(E15) <- E15$DF.classifications_0.25_0.005_317
+
+E15 <- subset(E15, idents = c("Singlet"))
+
+#Sanity Check
+View(E15@meta.data)
+DimPlot(E15, reduction = "umap", group.by = "DF.classifications_0.25_0.005_317",order = T)
+
+Idents(E15) <- E15$seurat_clusters #set idents back to clusters
+
+##Have to re-run all relevant analyses after filtering out doublets
+```
+
+# normalize expression level
+```{r}
+E15 <- NormalizeData(E15, normalization.method = "LogNormalize", scale.factor = 10000)
+
+View(E15@meta.data)
+```
+
+# identify 2000 most variable genes/features, to be used for downstream analysis
+```{r}
+E15 <- FindVariableFeatures(E15, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(E15), 10)
+top10
+
+plot1 <- VariableFeaturePlot(E15)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+
+# Preparation stage for PCA analyses, need to use ScaleData() to scale and center all data
+```{r}
+all.genes <- rownames(E15)
+E15 <- ScaleData(E15, features = all.genes)
+E15 <- ScaleData(E15, vars.to.regress = "percent.mt") # regress out the effects of mitochondria variation
+```
+
+# Linear dimention reduction (PCA), use most variable features by default
+```{r}
+E15 <- RunPCA(E15, features = VariableFeatures(object = E15))
+print(E15[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(E15, dims = 1:2, reduction = "pca")
+```
+
+# make PCA dimension plots
+```{r}
+DimPlot(E15, reduction = "pca")
+DimHeatmap(E15, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(E15, dims = 1:5, cells = 500, balanced = TRUE)
+```
+
+# determine number of PCs in the dataset
+```{r message=FALSE}
+#E15 <- JackStraw(E15, num.replicate = 100)
+#E15 <- ScoreJackStraw(E15, dims = 1:20)
+#JackStrawPlot(E15, dims = 1:15)
+
+ElbowPlot(E15)
+```
+
+# cell clustering
+```{r cell-clustering}
+E15 <- FindNeighbors(E15, dims = 1:10)
+E15 <- FindClusters(E15, resolution = 0.5)
+head(Idents(E15), 5)
+E15 <- RunTSNE(E15, dims = 1:10)
+DimPlot(E15,reduction = "tsne",label = TRUE,pt.size = 1.5)
+
+E15 <- RunUMAP(E15, dims = 1:10)
+DimPlot(E15,reduction = "umap",label = TRUE,pt.size = 1.5)
+
+View (E15@meta.data)
+```
+
+# save results
+```{r}
+saveRDS(E15, file = "./E15.rds")
+save(E15,file="./E15.Robj")
+```
+
+##Start of NoE15##
+
+#load NoE15 dataset
+```{r}
+# read the NoE15 sample
+NoE15.data <- Read10X(data.dir = "NoE15/outs/filtered_feature_bc_matrix/")
+
+dim(NoE15.data)
+NoE15.data[1:10,1:6]
+```
+
+# Create a Seurat object and filter data
+```{r message=FALSE}
+NoE15 <- CreateSeuratObject(counts = NoE15.data, project = "ssbm.noe15.8k", min.cells = 3, min.features = 200)
+View(NoE15@meta.data)
+
+NoE15[["percent.mt"]] <- PercentageFeatureSet(NoE15, pattern = "^MT-")
+```
+
+# Filter and subset cells
+```{r}
+NoE15 <- subset(NoE15, subset = nFeature_RNA > 500 & nFeature_RNA < 7500 & percent.mt < 10)
+dim(NoE15)
+# 24570  7863
+```
+
+# normalize expression level
+```{r}
+NoE15 <- NormalizeData(NoE15, normalization.method = "LogNormalize", scale.factor = 10000)
+
+View(NoE15@meta.data)
+```
+
+# identify 2000 most variable genes/features, to be used for downstream analysis
+```{r}
+NoE15 <- FindVariableFeatures(NoE15, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(NoE15), 10)
+top10
+
+plot1 <- VariableFeaturePlot(NoE15)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+
+# Preparation stage for PCA analyses, need to use ScaleData() to scale and center all data
+
+```{r}
+all.genes <- rownames(NoE15)
+NoE15 <- ScaleData(NoE15, features = all.genes)
+NoE15 <- ScaleData(NoE15, vars.to.regress = "percent.mt") # regress out the effects of mitochondria variation
+```
+
+# Linear dimention reduction (PCA), use most variable features by default
+```{r}
+NoE15 <- RunPCA(NoE15, features = VariableFeatures(object = NoE15))
+print(NoE15[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(NoE15, dims = 1:2, reduction = "pca")
+```
+
+# make PCA dimension plots
+```{r}
+DimPlot(NoE15, reduction = "pca")
+DimHeatmap(NoE15, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(NoE15, dims = 1:5, cells = 500, balanced = TRUE)
+```
+
+# determine number of PCs in the dataset
+```{r message=FALSE}
+#NoE15 <- JackStraw(NoE15, num.replicate = 100)
+#NoE15 <- ScoreJackStraw(NoE15, dims = 1:20)
+#JackStrawPlot(NoE15, dims = 1:15)
+
+ElbowPlot(NoE15)
+```
+
+# cell clustering
+```{r cell-clustering}
+NoE15 <- FindNeighbors(NoE15, dims = 1:10)
+NoE15 <- FindClusters(NoE15, resolution = 0.5)
+head(Idents(NoE15), 5)
+NoE15 <- RunTSNE(NoE15, dims = 1:10)
+DimPlot(NoE15,reduction = "tsne",label = TRUE,pt.size = 1.5)
+
+NoE15 <- RunUMAP(NoE15, dims = 1:10)
+DimPlot(NoE15,reduction = "umap",label = TRUE,pt.size = 1.5)
+
+View (NoE15@meta.data)
+```
+
+# score cell cycle
+```{r cell-cycle-score}
+NoE15<- CellCycleScoring(object = NoE15, g2m.features = cc.genes$g2m.genes, s.features = cc.genes$s.genes)
+View(NoE15@meta.data)
+DimPlot(NoE15,reduction = "umap",label = TRUE,group.by="Phase",pt.size = 1.5)
+#DimPlot(NoE15,reduction = "tsne",label = TRUE,group.by="Phase",pt.size = 1.5)
+```
+
+# doublet finder
+```{r message=FALSE}
+library(DoubletFinder)
+sweep.res.list_NoE15 <- paramSweep(NoE15, PCs = 1:10, sct = FALSE)
+sweep.stats_NoE15 <- summarizeSweep(sweep.res.list_NoE15, GT = FALSE)
+bcmvn_NoE15 <- find.pK(sweep.stats_NoE15)
+opt_pK <- as.numeric(as.vector(bcmvn_NoE15$pK[which.max(bcmvn_NoE15$BCmetric)]))
+print(opt_pK)
+
+
+annotations <- NoE15@meta.data$seurat_clusters
+homotypic.prop <- modelHomotypic(annotations)           
+nExp_poi <- round(0.06*nrow(NoE15@meta.data))  
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+# find doublets
+NoE15 <- doubletFinder(NoE15,PCs = 1:10,pN = 0.25,pK = opt_pK,nExp = nExp_poi.adj,reuse.pANN = FALSE,sct = FALSE)
+
+View(NoE15@meta.data)
+names(NoE15@meta.data)
+
+#must copy the variable name from meta data before running following:
+
+DimPlot(NoE15, reduction = "umap", group.by = "DF.classifications_0.25_0.005_428",order = T)
+#DimPlot(NoE15, reduction = "tsne", group.by = "DF.classifications_0.25_0.005_428",order = T)
+table(NoE15$DF.classifications_0.25_0.005_428)
+
+#Doublet Singlet 
+#    428    7435
+```
+
+##Filter out doublets
+```{r}
+names(NoE15@meta.data)
+
+#copy correct variable name following the $
+Idents(NoE15) <- NoE15$DF.classifications_0.25_0.005_428
+
+NoE15 <- subset(NoE15, idents = c("Singlet"))
+
+#Sanity Check
+View(NoE15@meta.data)
+DimPlot(NoE15, reduction = "umap", group.by = "DF.classifications_0.25_0.005_428",order = T)
+
+Idents(NoE15) <- NoE15$seurat_clusters #set idents back to clusters
+
+##Have to re-run all relevant analyses after filtering out doublets
+```
+
+##Have to re-run all relevant analyses after filtering out doublets (starting at normalization, then 2000 most variable genes, clustering, etc)
+
+# normalize expression level
+```{r}
+NoE15 <- NormalizeData(NoE15, normalization.method = "LogNormalize", scale.factor = 10000)
+
+View(NoE15@meta.data)
+```
+
+# identify 2000 most variable genes/features, to be used for downstream analysis
+```{r}
+NoE15 <- FindVariableFeatures(NoE15, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(NoE15), 10)
+top10
+
+plot1 <- VariableFeaturePlot(NoE15)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+
+# Preparation stage for PCA analyses, need to use ScaleData() to scale and center all data
+
+```{r}
+all.genes <- rownames(NoE15)
+NoE15 <- ScaleData(NoE15, features = all.genes)
+NoE15 <- ScaleData(NoE15, vars.to.regress = "percent.mt") # regress out the effects of mitochondria variation
+```
+
+# Linear dimention reduction (PCA), use most variable features by default
+```{r}
+NoE15 <- RunPCA(NoE15, features = VariableFeatures(object = NoE15))
+print(NoE15[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(NoE15, dims = 1:2, reduction = "pca")
+```
+
+# make PCA dimension plots
+```{r}
+DimPlot(NoE15, reduction = "pca")
+DimHeatmap(NoE15, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(NoE15, dims = 1:5, cells = 500, balanced = TRUE)
+```
+
+# determine number of PCs in the dataset
+```{r message=FALSE}
+#NoE15 <- JackStraw(NoE15, num.replicate = 100)
+#NoE15 <- ScoreJackStraw(NoE15, dims = 1:20)
+#JackStrawPlot(NoE15, dims = 1:15)
+
+ElbowPlot(NoE15)
+```
+
+# cell clustering
+```{r cell-clustering}
+NoE15 <- FindNeighbors(NoE15, dims = 1:10)
+NoE15 <- FindClusters(NoE15, resolution = 0.5)
+head(Idents(NoE15), 5)
+NoE15 <- RunTSNE(NoE15, dims = 1:10)
+DimPlot(NoE15,reduction = "tsne",label = TRUE,pt.size = 1.5)
+
+NoE15 <- RunUMAP(NoE15, dims = 1:10)
+DimPlot(NoE15,reduction = "umap",label = TRUE,pt.size = 1.5)
+
+View (NoE15@meta.data)
+```
+
+# save results
+```{r}
+saveRDS(NoE15, file = "./NoE15.rds")
+save(NoE15,file="./NoE15.Robj")
+```
+
+
+##Start of E16##
+
+
+#load E16 dataset
+```{r}
+# read the E16 sample
+E16.data <- Read10X(data.dir = "E16/outs/filtered_feature_bc_matrix/")
+
+dim(E16.data)
+E16.data[1:10,1:6]
+```
+
+# Create a Seurat object and filter data
+```{r message=FALSE}
+E16 <- CreateSeuratObject(counts = E16.data, project = "ssbm.e16.8k", min.cells = 3, min.features = 200)
+
+E16[["percent.mt"]] <- PercentageFeatureSet(E16, pattern = "^MT-")
+
+View(E16@meta.data)
+```
+
+# Filter and subset cells
+```{r}
+E16 <- subset(E16, subset = nFeature_RNA > 500 & nFeature_RNA < 7500 & percent.mt < 10)
+dim(E16)
+# 23778  6509
+```
+
+# normalize expression level
+```{r}
+E16 <- NormalizeData(E16, normalization.method = "LogNormalize", scale.factor = 10000)
+
+View(E16@meta.data)
+```
+
+# identify 2000 most variable genes/features, to be used for downstream analysis
+```{r}
+E16 <- FindVariableFeatures(E16, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(E16), 10)
+top10
+
+plot1 <- VariableFeaturePlot(E16)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+
+# Preparation stage for PCA analyses, need to use ScaleData() to scale and center all data
+```{r}
+all.genes <- rownames(E16)
+E16 <- ScaleData(E16, features = all.genes)
+E16 <- ScaleData(E16, vars.to.regress = "percent.mt") # regress out the effects of mitochondria variation
+```
+
+# Linear dimention reduction (PCA), use most variable features by default
+```{r}
+E16 <- RunPCA(E16, features = VariableFeatures(object = E16))
+print(E16[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(E16, dims = 1:2, reduction = "pca")
+```
+
+# make PCA dimension plots
+```{r}
+DimPlot(E16, reduction = "pca")
+DimHeatmap(E16, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(E16, dims = 1:5, cells = 500, balanced = TRUE)
+```
+
+# determine number of PCs in the dataset
+```{r message=FALSE}
+#E16 <- JackStraw(E16, num.replicate = 100)
+#E16 <- ScoreJackStraw(E16, dims = 1:20)
+#JackStrawPlot(E16, dims = 1:15)
+
+ElbowPlot(E16)
+```
+
+# cell clustering
+```{r cell-clustering}
+E16 <- FindNeighbors(E16, dims = 1:10)
+E16 <- FindClusters(E16, resolution = 0.5)
+head(Idents(E16), 5)
+E16 <- RunTSNE(E16, dims = 1:10)
+DimPlot(E16,reduction = "tsne",label = TRUE,pt.size = 1.5)
+
+E16 <- RunUMAP(E16, dims = 1:10)
+DimPlot(E16,reduction = "umap",label = TRUE,pt.size = 1.5)
+
+View (E16@meta.data)
+```
+
+# score cell cycle
+```{r cell-cycle-score}
+E16<- CellCycleScoring(object = E16, g2m.features = cc.genes$g2m.genes, s.features = cc.genes$s.genes)
+View(E16@meta.data)
+DimPlot(E16,reduction = "umap",label = TRUE,group.by="Phase",pt.size = 1.5)
+#DimPlot(E16,reduction = "tsne",label = TRUE,group.by="Phase",pt.size = 1.5)
+```
+
+# doublet finder
+```{r message=FALSE}
+library(DoubletFinder)
+sweep.res.list_E16 <- paramSweep(E16, PCs = 1:10, sct = FALSE)
+sweep.stats_E16 <- summarizeSweep(sweep.res.list_E16, GT = FALSE)
+bcmvn_E16 <- find.pK(sweep.stats_E16)
+opt_pK <- as.numeric(as.vector(bcmvn_E16$pK[which.max(bcmvn_E16$BCmetric)]))
+print(opt_pK)
+
+
+annotations <- E16@meta.data$seurat_clusters
+homotypic.prop <- modelHomotypic(annotations)           
+nExp_poi <- round(0.06*nrow(E16@meta.data))  
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+# find doublets
+E16 <- doubletFinder(E16,PCs = 1:10,pN = 0.25,pK = opt_pK,nExp = nExp_poi.adj,reuse.pANN = FALSE,sct = FALSE)
+
+View(E16@meta.data)
+names(E16@meta.data)
+
+#must copy the variable name from meta data before running following:
+
+DimPlot(E16, reduction = "umap", group.by = "DF.classifications_0.25_0.17_339",order = T)
+#DimPlot(E16, reduction = "tsne", group.by = "DF.classifications_0.25_0.17_339",order = T)
+table(E16$DF.classifications_0.25_0.17_339)
+
+#Doublet Singlet 
+#    339    6170
+```
+
+##Filter out doublets
+```{r}
+names(E16@meta.data)
+
+#copy correct variable name following the $
+Idents(E16) <- E16$DF.classifications_0.25_0.17_339
+
+E16 <- subset(E16, idents = c("Singlet"))
+
+#Sanity Check
+View(E16@meta.data)
+DimPlot(E16, reduction = "umap", group.by = "DF.classifications_0.25_0.17_339",order = T)
+
+Idents(E16) <- E16$seurat_clusters #set idents back to clusters
+
+##Have to re-run all relevant analyses after filtering out doublets
+```
+
+##Have to re-run all relevant analyses after filtering out doublets (starting at normalization, then 2000 most variable genes, clustering, etc)
+
+# normalize expression level
+```{r}
+E16 <- NormalizeData(E16, normalization.method = "LogNormalize", scale.factor = 10000)
+
+View(E16@meta.data)
+```
+
+# identify 2000 most variable genes/features, to be used for downstream analysis
+```{r}
+E16 <- FindVariableFeatures(E16, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(E16), 10)
+top10
+
+plot1 <- VariableFeaturePlot(E16)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+
+# Preparation stage for PCA analyses, need to use ScaleData() to scale and center all data
+```{r}
+all.genes <- rownames(E16)
+E16 <- ScaleData(E16, features = all.genes)
+E16 <- ScaleData(E16, vars.to.regress = "percent.mt") # regress out the effects of mitochondria variation
+```
+
+# Linear dimention reduction (PCA), use most variable features by default
+```{r}
+E16 <- RunPCA(E16, features = VariableFeatures(object = E16))
+print(E16[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(E16, dims = 1:2, reduction = "pca")
+```
+
+# make PCA dimension plots
+```{r}
+DimPlot(E16, reduction = "pca")
+DimHeatmap(E16, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(E16, dims = 1:5, cells = 500, balanced = TRUE)
+```
+
+# determine number of PCs in the dataset
+```{r message=FALSE}
+#E16 <- JackStraw(E16, num.replicate = 100)
+#E16 <- ScoreJackStraw(E16, dims = 1:20)
+#JackStrawPlot(E16, dims = 1:15)
+
+ElbowPlot(E16)
+```
+
+# cell clustering
+```{r cell-clustering}
+E16 <- FindNeighbors(E16, dims = 1:10)
+E16 <- FindClusters(E16, resolution = 0.5)
+head(Idents(E16), 5)
+E16 <- RunTSNE(E16, dims = 1:10)
+DimPlot(E16,reduction = "tsne",label = TRUE,pt.size = 1.5)
+
+E16 <- RunUMAP(E16, dims = 1:10)
+DimPlot(E16,reduction = "umap",label = TRUE,pt.size = 1.5)
+
+View (E16@meta.data)
+```
+
+# save results
+```{r}
+saveRDS(E16, file = "./E16.rds")
+save(E16,file="./E16.Robj")
+```
+
+##Start of NoE16##
+
+#load NoE16 dataset
+```{r}
+# read the NoE16 sample
+NoE16.data <- Read10X(data.dir = "NoE16/outs/filtered_feature_bc_matrix/")
+
+dim(NoE16.data)
+NoE16.data[1:10,1:6]
+```
+
+# Create a Seurat object and filter data
+```{r message=FALSE}
+NoE16 <- CreateSeuratObject(counts = NoE16.data, project = "ssbm.noe16.8k", min.cells = 3, min.features = 200)
+
+NoE16[["percent.mt"]] <- PercentageFeatureSet(NoE16, pattern = "^MT-")
+
+View(NoE16@meta.data)
+```
+
+# Filter and subset cells
+```{r}
+NoE16 <- subset(NoE16, subset = nFeature_RNA > 500 & nFeature_RNA < 7500 & percent.mt < 10)
+dim(NoE16)
+# 24891  7362
+```
+
+# normalize expression level
+```{r}
+NoE16 <- NormalizeData(NoE16, normalization.method = "LogNormalize", scale.factor = 10000)
+
+View(NoE16@meta.data)
+```
+
+# identify 2000 most variable genes/features, to be used for downstream analysis
+```{r}
+NoE16 <- FindVariableFeatures(NoE16, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(NoE16), 10)
+top10
+
+plot1 <- VariableFeaturePlot(NoE16)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+
+# Preparation stage for PCA analyses, need to use ScaleData() to scale and center all data
+```{r}
+all.genes <- rownames(NoE16)
+NoE16 <- ScaleData(NoE16, features = all.genes)
+NoE16 <- ScaleData(NoE16, vars.to.regress = "percent.mt") # regress out the effects of mitochondria variation
+```
+
+# Linear dimention reduction (PCA), use most variable features by default
+```{r}
+NoE16 <- RunPCA(NoE16, features = VariableFeatures(object = NoE16))
+print(NoE16[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(NoE16, dims = 1:2, reduction = "pca")
+```
+
+# make PCA dimension plots
+```{r}
+DimPlot(NoE16, reduction = "pca")
+DimHeatmap(NoE16, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(NoE16, dims = 1:5, cells = 500, balanced = TRUE)
+```
+
+# determine number of PCs in the dataset
+```{r message=FALSE}
+#NoE16 <- JackStraw(NoE16, num.replicate = 100)
+#NoE16 <- ScoreJackStraw(NoE16, dims = 1:20)
+#JackStrawPlot(NoE16, dims = 1:15)
+
+ElbowPlot(NoE16)
+```
+
+# cell clustering
+```{r cell-clustering}
+NoE16 <- FindNeighbors(NoE16, dims = 1:10)
+NoE16 <- FindClusters(NoE16, resolution = 0.5)
+head(Idents(NoE16), 5)
+NoE16 <- RunTSNE(NoE16, dims = 1:10)
+DimPlot(NoE16,reduction = "tsne",label = TRUE,pt.size = 1.5)
+
+NoE16 <- RunUMAP(NoE16, dims = 1:10)
+DimPlot(NoE16,reduction = "umap",label = TRUE,pt.size = 1.5)
+
+View (NoE16@meta.data)
+```
+
+# score cell cycle
+```{r cell-cycle-score}
+NoE16<- CellCycleScoring(object = NoE16, g2m.features = cc.genes$g2m.genes, s.features = cc.genes$s.genes)
+View(NoE16@meta.data)
+DimPlot(NoE16,reduction = "umap",label = TRUE,group.by="Phase",pt.size = 1.5)
+#DimPlot(NoE16,reduction = "tsne",label = TRUE,group.by="Phase",pt.size = 1.5)
+```
+
+# doublet finder
+```{r message=FALSE}
+library(DoubletFinder)
+sweep.res.list_NoE16 <- paramSweep(NoE16, PCs = 1:10, sct = FALSE)
+sweep.stats_NoE16 <- summarizeSweep(sweep.res.list_NoE16, GT = FALSE)
+bcmvn_NoE16 <- find.pK(sweep.stats_NoE16)
+opt_pK <- as.numeric(as.vector(bcmvn_NoE16$pK[which.max(bcmvn_NoE16$BCmetric)]))
+print(opt_pK)
+
+
+annotations <- NoE16@meta.data$seurat_clusters
+homotypic.prop <- modelHomotypic(annotations)           
+nExp_poi <- round(0.06*nrow(NoE16@meta.data))  
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+# find doublets
+NoE16 <- doubletFinder(NoE16,PCs = 1:10,pN = 0.25,pK = opt_pK,nExp = nExp_poi.adj,reuse.pANN = FALSE,sct = FALSE)
+
+View(NoE16@meta.data)
+names(NoE16@meta.data)
+
+#must copy the variable name from meta data before running following:
+
+DimPlot(NoE16, reduction = "umap", group.by = "DF.classifications_0.25_0.05_398",order = T)
+#DimPlot(NoE16, reduction = "tsne", group.by = "DF.classifications_0.25_0.05_398",order = T)
+table(NoE16$DF.classifications_0.25_0.05_398)
+
+#Doublet Singlet 
+#    398    6964
+```
+
+##Filter out doublets
+```{r}
+names(NoE16@meta.data)
+
+#copy correct variable name following the $
+Idents(NoE16) <- NoE16$DF.classifications_0.25_0.05_398
+
+NoE16 <- subset(NoE16, idents = c("Singlet"))
+
+#Sanity Check
+View(NoE16@meta.data)
+DimPlot(NoE16, reduction = "umap", group.by = "DF.classifications_0.25_0.05_398",order = T)
+
+Idents(NoE16) <- NoE16$seurat_clusters #set idents back to clusters
+
+##Have to re-run all relevant analyses after filtering out doublets
+```
+
+##Have to re-run all relevant analyses after filtering out doublets (starting at normalization, then 2000 most variable genes, clustering, etc)
+
+# normalize expression level
+```{r}
+NoE16 <- NormalizeData(NoE16, normalization.method = "LogNormalize", scale.factor = 10000)
+
+View(NoE16@meta.data)
+```
+
+# identify 2000 most variable genes/features, to be used for downstream analysis
+```{r}
+NoE16 <- FindVariableFeatures(NoE16, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(NoE16), 10)
+top10
+
+plot1 <- VariableFeaturePlot(NoE16)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+
+# Preparation stage for PCA analyses, need to use ScaleData() to scale and center all data
+```{r}
+all.genes <- rownames(NoE16)
+NoE16 <- ScaleData(NoE16, features = all.genes)
+NoE16 <- ScaleData(NoE16, vars.to.regress = "percent.mt") # regress out the effects of mitochondria variation
+```
+
+# Linear dimention reduction (PCA), use most variable features by default
+```{r}
+NoE16 <- RunPCA(NoE16, features = VariableFeatures(object = NoE16))
+print(NoE16[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(NoE16, dims = 1:2, reduction = "pca")
+```
+
+# make PCA dimension plots
+```{r}
+DimPlot(NoE16, reduction = "pca")
+DimHeatmap(NoE16, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(NoE16, dims = 1:5, cells = 500, balanced = TRUE)
+```
+
+# determine number of PCs in the dataset
+```{r message=FALSE}
+#NoE16 <- JackStraw(NoE16, num.replicate = 100)
+#NoE16 <- ScoreJackStraw(NoE16, dims = 1:20)
+#JackStrawPlot(NoE16, dims = 1:15)
+
+ElbowPlot(NoE16)
+```
+
+# cell clustering
+```{r cell-clustering}
+NoE16 <- FindNeighbors(NoE16, dims = 1:10)
+NoE16 <- FindClusters(NoE16, resolution = 0.5)
+head(Idents(NoE16), 5)
+NoE16 <- RunTSNE(NoE16, dims = 1:10)
+DimPlot(NoE16,reduction = "tsne",label = TRUE,pt.size = 1.5)
+
+NoE16 <- RunUMAP(NoE16, dims = 1:10)
+DimPlot(NoE16,reduction = "umap",label = TRUE,pt.size = 1.5)
+
+View (NoE16@meta.data)
+```
+
+# save results
+```{r}
+saveRDS(NoE16, file = "./NoE16.rds")
+save(NoE16,file="./NoE16.Robj")
+```
+
+
+##Start of merged datasets##
+
+#Load datasets
+```{r}
+# read the integrated sample
+E15 = readRDS("E15.rds")
+NoE15 = readRDS("NoE15.rds")
+E16 = readRDS("E16.rds")
+NoE16 = readRDS("NoE16.rds")
+```
+
+##Assign treatment groups
+```{r}
+E15[["tmt.group"]] <- "+EPO"
+NoE15[["tmt.group"]] <- "-EPO"
+E16[["tmt.group"]] <- "+EPO"
+NoE16[["tmt.group"]] <- "-EPO"
+
+#check
+View(E15@meta.data)
+```
+
+#Merge datasets
+```{r}
+BM.merged <- merge(E15, y = c(NoE15, E16, NoE16))
+```
+
+##Re-cluster
+```{r}
+#Normalize expression level 
+BM.merged <- NormalizeData(BM.merged, normalization.method = "LogNormalize", scale.factor = 10000)
+
+#Identify 2000 most variable features/genes, to be used for downstream analysis 
+BM.merged <- FindVariableFeatures(BM.merged, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(BM.merged), 10)
+top10
+
+plot1 <- VariableFeaturePlot(BM.merged)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1
+plot2
+
+# Preparation stage for PCA analyses, need to use ScaleData() to scale and center all data
+all.genes <- rownames(BM.merged)
+BM.merged <- ScaleData(BM.merged, features = all.genes)
+#BM.merged <- ScaleData(BM.merged, vars.to.regress = "percent.mt") 
+
+# Linear dimention reduction (PCA), use most variable features by default
+BM.merged <- RunPCA(BM.merged, features = VariableFeatures(object = BM.merged))
+print(BM.merged[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(BM.merged, dims = 1:2, reduction = "pca")
+
+# make PCA dimension plots
+DimPlot(BM.merged, reduction = "pca")
+DimHeatmap(BM.merged, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(BM.merged, dims = 1:5, cells = 500, balanced = TRUE)
+
+# determine number of PCs in the dataset
+#BM.merged <- JackStraw(BM.merged, num.replicate = 100) <- not needed
+#BM.merged <- ScoreJackStraw(BM.merged, dims = 1:20)  <- not needed
+#JackStrawPlot(BM.merged, dims = 1:15) <- not needed
+
+ElbowPlot(BM.merged)
+
+# cell clustering
+BM.merged <- FindNeighbors(BM.merged, dims = 1:10, compute.SNN = TRUE)
+BM.merged <- FindClusters(BM.merged, resolution = 0.4)
+head(Idents(BM.merged), 10)
+
+BM.merged <- RunTSNE(BM.merged, dims = 1:10, check_duplicates = FALSE)
+DimPlot(BM.merged, reduction = "tsne",label = TRUE,pt.size = 1.5)
+
+BM.merged <- RunUMAP(BM.merged, dims = 1:10)
+DimPlot(BM.merged, reduction = "umap",label = TRUE, pt.size = 2)
+
+View (BM.merged@meta.data)
+
+##End of re-clustering.
+```
+
+# save results
+```{r}
+saveRDS(BM.merged, file = "./BMMerged.rds")
+save(BM.merged,file="./BMMerged.Robj")
+```
+
+# visualization using ShinnyCell
+```{r}
+library(ShinyCell)
+
+scConf = createConfig(BM.merged)
+makeShinyApp(BM.merged, scConf, gene.mapping = TRUE,
+             shiny.title = "BM Merged All Cells")
+
+setwd("D:/Bioinformatics Projects/BM.Merged/shinyApp")
+# verify change of dir in console using getwd()
+
+shiny::runApp()
+```
+
+##Subset out non-erythroid cell celusters
+```{r}
+Idents(BM.merged) <- BM.merged$seurat_clusters
+
+BM.merged <- subset(BM.merged, idents = c("0", "9", "2", "5", "6", "3","1","8"))
+```
+
+##Re-cluster
+```{r}
+#Normalize expression level 
+BM.merged <- NormalizeData(BM.merged, normalization.method = "LogNormalize", scale.factor = 10000)
+
+#Identify 2000 most variable features/genes, to be used for downstream analysis 
+BM.merged <- FindVariableFeatures(BM.merged, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(BM.merged), 10)
+top10
+
+plot1 <- VariableFeaturePlot(BM.merged)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1
+plot2
+
+# Preparation stage for PCA analyses, need to use ScaleData() to scale and center all data
+all.genes <- rownames(BM.merged)
+BM.merged <- ScaleData(BM.merged, features = all.genes)
+##BM.merged <- ScaleData(BM.merged, vars.to.regress = "percent.mt") # regress out the effects of mitochondria variation. I don't think I have to do this again, since done before integration
+
+# Linear dimention reduction (PCA), use most variable features by default
+BM.merged <- RunPCA(BM.merged, features = VariableFeatures(object = BM.merged))
+print(BM.merged[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(BM.merged, dims = 1:2, reduction = "pca")
+
+# make PCA dimension plots
+DimPlot(BM.merged, reduction = "pca")
+DimHeatmap(BM.merged, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(BM.merged, dims = 1:5, cells = 500, balanced = TRUE)
+
+# determine number of PCs in the dataset
+ElbowPlot(BM.merged)
+
+# cell clustering
+BM.merged <- FindNeighbors(BM.merged, dims = 1:10, compute.SNN = TRUE)
+BM.merged <- FindClusters(BM.merged, resolution = 0.5)
+head(Idents(BM.merged), 10)
+
+BM.merged <- RunTSNE(BM.merged, dims = 1:10)
+DimPlot(BM.merged, reduction = "tsne",label = TRUE,pt.size = 1.5)
+
+BM.merged <- RunUMAP(BM.merged, dims = 1:10)
+DimPlot(BM.merged, reduction = "umap",label = TRUE, pt.size = 2)
+#DimPlot(BM.merged, reduction = "umap",label = TRUE, pt.size = 2, cols = c("moccasin", "#00ffff", "gold", "#008000", "#ff1493", "#4682b4", "#00ff00", "red", "lightpink", "#EB75F4", "lightblue"))
+
+View (BM.merged@meta.data)
+
+##End of re-clustering.
+```
+
+##Monocle3
+```{r}
+# Convert the Seurat object to a Monocle3 cell_data_set
+Idents(BM.merged) <- BM.merged$seurat_clusters
+cds <- as.cell_data_set(BM.merged)
+cds 
+
+## get cell metadata
+colData(cds)
+
+## get gene metadata
+fData(cds)
+rownames(fData(cds))[1:10]
+fData(cds)$gene_short_name <- rownames(fData(cds))
+
+##to get counts
+counts(cds)
+
+##assign cluster partitions
+#create a named list (names = cell IDs, values = partition values (which is 1))
+recreate.partition <- c(rep(1, length(cds@colData@rownames))) #<- assign all the cells to one partition
+names(recreate.partition) <- cds@colData@rownames
+recreate.partition <- as.factor(recreate.partition)
+cds@clusters$UMAP$partitions <- recreate.partition # <- assign name list to partition
+
+##Assign the cluster information 
+list_cluster <- BM.merged@active.ident
+cds@clusters$UMAP$clusters <- list_cluster
+
+##Assign UMAP coordinates - cell embeddings 
+cds@int_colData@listData$reducedDims$UMAP <- BM.merged@reductions$umap@cell.embeddings
+
+#plot
+cluster.before.trajectory <- plot_cells(cds, color_cells_by = "cluster", label_groups_by_cluster = FALSE, group_label_size = 5) + theme(legend.position = "right")
+cluster.before.trajectory
+
+#cluster.names <- plot_cells(cds, color_cells_by = "cell_annotation", label_groups_by_cluster = FALSE, group_label_size = 5) + scale_color_manual(values = c("red", "blue", "green", "maroon", "yellow", "grey", "cyan")) + theme(legend.position = "right")
+
+#cluster.before.trajectory | cluster.names
+
+##Learn trajectory graph
+cds <- learn_graph(cds, use_partition = FALSE)
+
+plot_cells(cds, color_cells_by = "cluster", label_groups_by_cluster = FALSE, label_branch_points = FALSE, label_roots = FALSE, label_leaves = FALSE, group_label_size = 5)
+
+##order cells in pseudotime
+cds <- order_cells(cds, reduction_method = "UMAP", root_cells = colnames(cds[,clusters(cds) == 0])) #<- delete ", root_cells = colnames(cds.ery[,clusters(cds.ery) == 0])" if you want to select your own root nodes
+
+plot_cells(cds, color_cells_by = "pseudotime", label_groups_by_cluster = FALSE, label_branch_points = FALSE, label_roots = FALSE, label_leaves = FALSE, group_label_size = 5, show_trajectory_graph = FALSE) 
+
+##Cells ordered by monocle3 pseudotime
+pseudotime(cds)
+cds$monocle3_pseudotime <- pseudotime(cds)
+cds@colData
+data.pseudo <- as.data.frame(colData(cds))
+
+ggplot(data.pseudo, aes(monocle3_pseudotime, seurat_clusters, fill = seurat_clusters)) + geom_boxplot()
+ggplot(data.pseudo, aes(monocle3_pseudotime, reorder(seurat_clusters, monocle3_pseudotime, median), fill = seurat_clusters)) + geom_boxplot()
+
+##To plot genes in pseudotime##
+#cds.genes <- cds@colData
+#cds <- estimate_size_factors(cds)
+#genes <- c("ENG", "GYPA", "TFRC")
+#cds.subset <- cds[rowData(cds)$gene_short_name %in% genes]
+#cds.subset <- order_cells(cds.subset)
+
+#plot_genes_in_pseudotime(cds.subset, color_cells_by = "seurat_clusters", min_expr = 1e-01) 
+```
+
+#name clusters and order them by pseudotime
+```{r}
+Idents(BM.merged) <- BM.merged$seurat_clusters
+levels(BM.merged)
+
+levels(BM.merged) <- c("0", "1", "9", "2", "3", "4", "10", "6", "8", "5", "7")
+levels(BM.merged)
+
+new.cluster.ids <- c("HSC/MPP/CMP", "HSC/MPP/CMP", "HSC/MPP/CMP", "MEP", "BFU-E", "CFU-E/ProE", "ProE", "BasoE", "BasoE", "PolyE", "OrthoE")
+
+names(new.cluster.ids) <- levels(BM.merged)
+BM.merged <- RenameIdents(BM.merged, new.cluster.ids)
+BM.merged$cell_annotation <- Idents(BM.merged)
+levels(BM.merged)
+
+Idents(BM.merged) <- BM.merged$seurat_clusters
+levels(BM.merged)
+
+levels(BM.merged) <- c("0", "1", "9", "2", "3", "4", "10", "6", "8", "5", "7")
+levels(BM.merged)
+
+new.cluster.ids <- c("C0", "C1", "C9", "C2", "C3", "C4", "C10", "C6", "C8", "C5", "C7")
+names(new.cluster.ids) <- levels(BM.merged)
+BM.merged <- RenameIdents(BM.merged, new.cluster.ids)
+BM.merged$clusters_ordered <- Idents(BM.merged)
+levels(BM.merged)
+
+DimPlot(BM.merged, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.5)
+
+##to make UMAP with most different colors
+#library(randomcoloR)
+#nColor <- 11
+#myColor <- randomcoloR::distinctColorPalette(k = nColor)
+#pie(rep(1, nColor), col = myColor)
+
+#DimPlot(BM.merged, reduction = "umap", cols = myColor, label = TRUE, repel = TRUE, pt.size = 0.5)
+```
+
+
+# save results
+```{r}
+saveRDS(BM.merged, file = "./BMMerged_EryAnnotated.rds")
+save(BM.merged,file="./BMMerged_EryAnnotated.Robj")
+```
+
+# visualization using ShinnyCell
+```{r}
+library(ShinyCell)
+
+scConf = createConfig(BM.merged)
+makeShinyApp(BM.merged, scConf, gene.mapping = TRUE,
+             shiny.title = "BM Merged Erythroid Only Annotated and Ordered")
+
+setwd("D:/Bioinformatics Projects/BM_integrated_NS/shinyApp")
+# verify change of dir in console using getwd()
+
+shiny::runApp()
+```
+
+
+#Get +/-EPO DEGS
+```{r}
+BM.merged = readRDS("BMMerged_EryAnnotated.rds")
+
+levels(BM.merged)
+Idents(BM.merged) <- BM.merged$seurat_clusters
+levels(BM.merged)
+
+##subset if needed
+BM.merged.subset <- subset(BM.merged, idents = c("3", "4"))
+
+levels(BM.merged.subset)
+Idents(BM.merged.subset) <- BM.merged.subset$tmt.group
+levels(BM.merged.subset)
+
+BM.merged.DEG.EPO <- FindAllMarkers(BM.merged.subset, only.pos = FALSE, min.pct = 0.10, logfc.threshold = 0, test.use = "wilcox", return.thresh = 0.05)
+#BM.merged.DEG.EPOonly <- FindMarkers(BM.merged.subset, ident.1 = "+EPO", only.pos = FALSE, min.pct = 0.10, logfc.threshold = 0.2, test.use = "wilcox", return.thresh = 0.05)
+write.csv(BM.merged.DEG.EPO, file="./DEGs_EPO.csv")
+#write.csv(BM.merged.DEG.EPOonly, file="./DEGs_EPOonly.csv")
+
+#Can get DEGs by EPO for whole Erythroid UMAP
+#BM.merged.DEG.EPO <- FindAllMarkers(BM.merged, only.pos = FALSE, min.pct = 0.10, logfc.threshold = 0, test.use = "wilcox", return.thresh = 0.05)
+#BM.merged.DEG.EPO <- FindMarkers(BM.merged, ident.1 = "+EPO", only.pos = FALSE, min.pct = 0.10, logfc.threshold = 0, test.use = "wilcox", return.thresh = 0.05)
+#write.csv(BM.merged.subset.DEG.EPO, file="./DEGsbyEPO.csv")
+```
+
+
+#Get DEG lists by cluster
+```{r}
+Idents(BM.merged) <- BM.merged$seurat_clusters
+levels(BM.merged)
+
+BM.merged.DEG <- FindAllMarkers(BM.merged, only.pos = FALSE, min.pct = 0.10, logfc.threshold = 0, test.use = "wilcox", return.thresh = 0.05)
+write.csv(BM.merged.DEG, file="./DEGsby_Cluster.csv")
+
+#BM.merged.DEG <- FindMarkers(BM.merged.DEG, ident.1 = "2", only.pos = FALSE, min.pct = 0.10, logfc.threshold = 0, test.use = "wilcox", return.thresh = 0.05)
+#write.csv(BM.merged.DEG, file="./DEGsCluster2.csv")
+```
+
+#Vizualize DEGs (heatmap)
+```{r}
+top20 <- BM.merged.DEG %>% group_by(cluster) %>% top_n(20, avg_log2FC)
+#top15 <- BM.merged.DEG.heatmap %>% group_by(cluster) %>% top_n(15, avg_log2FC)
+
+levels(BM.merged)
+levels(BM.merged) <- c("0", "1", "9", "2", "3", "4", "10", "6", "8", "5", "7")
+levels(BM.merged)
+
+DoHeatmap(BM.merged, features = top20$gene, label = TRUE, angle = 45) + theme(axis.text.y = element_text(size = 6))
+#DoHeatmap(BM.merged, features = top15$gene, label = TRUE, angle = 45) + theme(axis.text.y = element_text(size = 6))
+
+#For Epo DEGs
+Epo200 <- BM.merged.DEG.EPO %>% group_by(cluster) %>% top_n(200, avg_log2FC)
+
+DoHeatmap(BM.merged, features = Epo200$gene, label = TRUE, angle = 45) + theme(axis.text.y = element_text(size = 6))
+```
+
+#Bubble Plot
+```{r}
+library(readxl)
+
+bubble <- read_excel("GOTable.xlsx") # GOTable.xlsx is an excel file containing the gene ontology results from WebGestalt
+#bubble.short <- bubble[bubble$GO_Term %in% c("Spliceosome", "Ribosome", "Cell cycle", "DNA replication", "Porphyrin metabolism", "Platelet activation"), ]
+
+#order clusters
+bubble$Cluster <- factor(bubble$Cluster, levels = c("C0", "C1", "C9", "C2", "C3", "C4", "C10", "C6", "C8", "C5", "C7"))
+bubble$GO_Term <- factor(bubble$GO_Term, levels = c("Oxidative phosphorylation", "Glycolysis / Gluconeogenesis", "glycosphingolipid biosynthesis", "Cholesterol metabolism", "Biosynthesis of unsaturated fatty acids", "Fatty acid metabolism", "Calcium signaling pathway", "Focal adhesion", "Mitophagy", "Ferroptosis", "Platelet activation", "Ribosome", "Spliceosome", "Cell cycle", "Mismatch Repair", "DNA replication", "Porphyrin metabolism"))
+
+#bubble.short$Cluster <- factor(bubble.short$Cluster, levels = c("C0", "C1", "C9", "C2", "C3", "C4", "C10", "C6", "C8", "C5", "C7"))
+#bubble.short$GO_Term <- factor(bubble.short$GO_Term, levels = c("Spliceosome", "Ribosome", "Cell cycle", "DNA replication", "Porphyrin metabolism", "Platelet activation"))
+
+#Plot
+ggplot(bubble, aes(x = Cluster, y = GO_Term)) + geom_point(aes(color = Normalized_Enrichment_score, size = FDR), alpha = 1) + scale_color_gradient(low = "blue", high = "red") + scale_size_continuous(trans = "reverse")
+
+#ggplot(bubble.short, aes(x = Cluster, y = GO_Term)) + geom_point(aes(color = Normalized_Enrichment_score, size = FDR), alpha = 1) + scale_color_gradient(low = "blue", high = "red") + scale_size_continuous(trans = "reverse")
+```
